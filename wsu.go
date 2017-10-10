@@ -15,6 +15,7 @@
 package wsu
 
 import (
+	"bytes"
 	"errors"
 	"sync"
 	"time"
@@ -82,6 +83,10 @@ func NewClientConnection(cs *ClientSetup) (*Connection, error) {
 		return nil, err
 	}
 
+	return ConnectionFromWebsocket(conn)
+}
+
+func ConnectionFromWebsocket(conn *websocket.Conn) (*Connection, error) {
 	cancelChan, cancelFn := makeCanceler()
 	writeChan := make(chan *Message)
 	readChan := make(chan *Message)
@@ -111,14 +116,12 @@ func NewClientConnection(cs *ClientSetup) (*Connection, error) {
 
 	// Read goroutine
 	go func() {
-		recvBuf := make([]byte, 32*1024*1024)
+		maxBufLen := 32 * 1024 // The frames are mostly 16KiB anyways, expense it at 32KiB
+		zeroesBlock := bytes.Repeat([]byte(`\\0`), maxBufLen)
+		recvBuf := make([]byte, maxBufLen)
 		sequence := uint64(0)
-		var readWG sync.WaitGroup
 
-		defer func() {
-			readWG.Wait()
-			close(readChan)
-		}()
+		defer close(readChan)
 
 		for {
 			select {
@@ -133,6 +136,10 @@ func NewClientConnection(cs *ClientSetup) (*Connection, error) {
 				if err == nil && n > 0 {
 					buf = make([]byte, n)
 					copy(buf, recvBuf[:n])
+					// We need to zero out the rest of the bytes
+					if n < maxBufLen {
+						copy(recvBuf[n:], zeroesBlock)
+					}
 				}
 
 				msg := &Message{
@@ -142,12 +149,9 @@ func NewClientConnection(cs *ClientSetup) (*Connection, error) {
 					TimeAt:   recvTime,
 				}
 
-				// It is essential that we don't block sending this frame
-				readWG.Add(1)
-				go func(rMsg *Message) {
-					readChan <- rMsg
-					readWG.Done()
-				}(msg)
+				// Previously we had sending on the readChan not blocking
+				// but that caused problems with out of sequence frames.
+				readChan <- msg
 			}
 		}
 	}()
